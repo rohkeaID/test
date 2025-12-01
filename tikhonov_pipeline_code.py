@@ -283,6 +283,174 @@ def solve_tikhonov_robust(A, Gamma_diag, B,
             "solve_tikhonov_robust: all fallbacks failed. "
             f"Eigen fallback exception: {last_eig_exc}. Last fallback exception: {e2}"
         )
+        
+import numpy as np
+import scipy.linalg as la
+import scipy.sparse as sp
+import scipy.sparse.linalg as spla
+import warnings
+warnings.filterwarnings("ignore")
+
+def solve_tikhonov_robust_2(A, Gamma_diag, B,
+                          min_gamma=1e-12,
+                          jitter_list=(1e-12,1e-11,1e-10,1e-9,1e-8,1e-7,1e-6),
+                          eig_clip=1e-12,
+                          lsq_lapack_drivers=('gelsy','gelsd','gelss'),
+                          lsqr_maxiter=None,
+                          normal_reg=1e-12):
+    """
+    Robust solver for (A^T A + diag(Gamma_diag)) X = A^T B with multi-stage fallbacks.
+
+    Attempts (in order):
+      1) Cholesky on M = A^T A + diag(Gamma)
+      2) Cholesky with small diagonal jitter (sequence)
+      3) Eigen-decomposition of M, clip small eigenvalues, invert via V diag(1/lam) V^T
+      4) Augmented least-squares (A_aug = [A; diag(sqrt(Gamma))]) solved via:
+           a) scipy.linalg.lstsq with robust lapack_driver(s)
+           b) scipy.sparse.linalg.lsqr (iterative)
+           c) regularized normal equations: (A_aug^T A_aug + lambda I) x = A_aug^T B_aug
+      5) If all fail -> informative RuntimeError.
+
+    Parameters:
+      A: (m x n) ndarray
+      Gamma_diag: (n,) ndarray
+      B: (m x T) ndarray
+      min_gamma: minimal allowed diagonal gamma
+      jitter_list: sequence of jitter magnitudes to try
+      eig_clip: minimal eigenvalue in eig fallback
+      lsq_lapack_drivers: sequence of LAPACK drivers to try with scipy.linalg.lstsq
+      lsqr_maxiter: max iterations for iterative lsqr (None -> default)
+      normal_reg: regularization lambda for regularized normal equations
+
+    Returns:
+      X: (n x T) ndarray
+    """
+    # ensure arrays and dtypes
+    A = np.asarray(A, dtype=np.float64)
+    B = np.asarray(B, dtype=np.float64)
+    Gamma_diag = np.asarray(Gamma_diag, dtype=np.float64).ravel()
+
+    m, n = A.shape
+    if Gamma_diag.size != n:
+        raise ValueError(f"Gamma_diag length ({Gamma_diag.size}) must equal number of columns n ({n})")
+
+    # enforce minimal gamma to avoid exact zeros
+    Gamma_diag = np.maximum(Gamma_diag, min_gamma)
+
+    At = A.T
+    ATA = At.dot(A)    # n x n
+    RHS = At.dot(B)    # n x T
+
+    # base symmetric matrix
+    M_base = ATA + np.diag(Gamma_diag)
+    M_base = (M_base + M_base.T) / 2.0
+
+    # prepare exception holders for informative error if all fail
+    eig_exc = None
+    lsqr_exc = None
+    reg_exc = None
+
+    # 1) Try Cholesky directly
+    try:
+        cho = la.cho_factor(M_base, overwrite_a=False, check_finite=False)
+        X = la.cho_solve(cho, RHS, overwrite_b=False)
+        return X
+    except la.LinAlgError:
+        pass
+
+    # 2) Try diagonal jitter sequence
+    for jitter in jitter_list:
+        M_try = M_base.copy()
+        M_try[np.diag_indices(n)] += jitter
+        M_try = (M_try + M_try.T) / 2.0
+        try:
+            cho = la.cho_factor(M_try, overwrite_a=False, check_finite=False)
+            X = la.cho_solve(cho, RHS, overwrite_b=False)
+            return X
+        except la.LinAlgError:
+            continue
+
+    # 3) Eigen-decomposition fallback (clip small/negative eigenvalues)
+    try:
+        eigvals, eigvecs = la.eigh(M_base)   # ascending eigenvalues
+        eigvals_clipped = np.maximum(eigvals, eig_clip)
+        inv_diag = 1.0 / eigvals_clipped
+        Vt_RHS = eigvecs.T.dot(RHS)
+        scaled = inv_diag[:, None] * Vt_RHS
+        X = eigvecs.dot(scaled)
+        return X
+    except Exception as e_eig:
+        eig_exc = e_eig
+
+    # 4) Augmented least-squares fallback
+    sqrtG = np.sqrt(Gamma_diag)         # length n
+    A_aug = np.vstack([A, np.diag(sqrtG)])      # (m+n) x n
+    B_aug = np.vstack([B, np.zeros((n, B.shape[1]), dtype=np.float64)])  # (m+n) x T
+
+    # Row scaling to improve conditioning for SVD/QR solvers
+    row_norms = np.linalg.norm(A_aug, axis=1)
+    row_norms_safe = np.where(row_norms < 1e-16, 1.0, row_norms)
+    S_inv = 1.0 / row_norms_safe
+    A_aug_scaled = (A_aug.T * S_inv).T
+    B_aug_scaled = (B_aug.T * S_inv).T
+
+    # 4a) try scipy.linalg.lstsq with different lapack drivers
+    try:
+        for drv in lsq_lapack_drivers:
+            try:
+                sol, resids, rank, s = la.lstsq(A_aug_scaled, B_aug_scaled, lapack_driver=drv)
+                # sol is (n x T) and already corresponds to scaled system
+                return sol
+            except Exception:
+                continue
+    except Exception:
+        # fall through to iterative lsqr
+        pass
+
+    # 4b) Try iterative lsqr (sparse) for each RHS
+    try:
+        A_csr = sp.csr_matrix(A_aug_scaled)
+        n_rhs = B_aug_scaled.shape[1]
+        X_sol = np.zeros((n, n_rhs), dtype=np.float64)
+        for j in range(n_rhs):
+            b_j = B_aug_scaled[:, j]
+            res_lsqr = spla.lsqr(A_csr, b_j, iter_lim=lsqr_maxiter)
+            x_j = res_lsqr[0]
+            X_sol[:, j] = x_j
+        return X_sol
+    except Exception as e_lsqr:
+        lsqr_exc = e_lsqr
+
+    # 4c) Regularized normal equations fallback
+    try:
+        N = A_aug_scaled.T.dot(A_aug_scaled)
+        lam = max(normal_reg, 1e-15)
+        N_reg = N + lam * np.eye(n)
+        N_reg = (N_reg + N_reg.T) / 2.0
+        RHS_reg = A_aug_scaled.T.dot(B_aug_scaled)
+        try:
+            cho = la.cho_factor(N_reg, overwrite_a=False, check_finite=False)
+            X_reg = la.cho_solve(cho, RHS_reg, overwrite_b=False)
+            return X_reg
+        except la.LinAlgError:
+            evals, evecs = la.eigh(N_reg)
+            evals_clipped = np.maximum(evals, 1e-16)
+            inv_diag = 1.0 / evals_clipped
+            Vt_RHS = evecs.T.dot(RHS_reg)
+            scaled = inv_diag[:, None] * Vt_RHS
+            X_reg = evecs.dot(scaled)
+            return X_reg
+    except Exception as e_reg:
+        reg_exc = e_reg
+
+    # Nothing worked — raise informative RuntimeError
+    raise RuntimeError(
+        "solve_tikhonov_robust: all fallbacks failed.\n"
+        f"Eigen fallback error: {repr(eig_exc)}\n"
+        f"LSQR iterative error: {repr(lsqr_exc)}\n"
+        f"Regularized normal eq error: {repr(reg_exc)}\n"
+    )
+
 
 
 # ----------------------------
