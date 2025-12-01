@@ -159,26 +159,111 @@ def column_leverage(Vt_keep: np.ndarray, p: float = 1.0):
 # MODULE: tikhonov_solver
 # ----------------------------
 
-def solve_tikhonov(A: np.ndarray, Gamma_diag: np.ndarray, B: np.ndarray):
+import numpy as np
+import scipy.linalg as la
+
+def solve_tikhonov_robust(A, Gamma_diag, B,
+                          min_gamma=1e-12,
+                          jitter_list=(1e-12, 1e-11, 1e-10, 1e-9, 1e-8, 1e-7, 1e-6),
+                          eig_clip=1e-12):
     """
-    Solve (A^T A + diag(Gamma_diag)) X = A^T B for X.
-    Uses Cholesky factorization where possible (SPD), fallback to solve.
+    Robust solver for (A^T A + diag(Gamma_diag)) X = A^T B.
+
+    Strategy:
+      1) Ensure Gamma_diag >= min_gamma (vectorized).
+      2) Try Cholesky on M = ATA + diag(Gamma).
+      3) If Cholesky fails, try adding small diagonal jitter values (loop).
+      4) If still fails, eigen-decompose M, clip eigenvalues from below to `eig_clip`,
+         and compute X = V diag(1/lam_clipped) V^T (A^T B).
+      5) Last resort: solve augmented least-squares (stack A and sqrt(Gamma) rows).
+
+    Inputs:
+      A : (m x n) ndarray
+      Gamma_diag : (n,) ndarray (or list) - diagonal of Gamma
+      B : (m x T) ndarray
+      min_gamma : scalar, minimal allowed gamma per coordinate
+      jitter_list : iterable of jitter scalars to try
+      eig_clip : minimal eigenvalue floor for inversion
+
+    Returns:
+      X : (n x T) ndarray
     """
+    # ensure arrays and dtypes
     A = np.asarray(A, dtype=np.float64)
-    Gamma_diag = np.asarray(Gamma_diag, dtype=np.float64)
     B = np.asarray(B, dtype=np.float64)
+    Gamma_diag = np.asarray(Gamma_diag, dtype=np.float64).ravel()  # ensure 1d
+
+    m, n = A.shape
+    if Gamma_diag.size != n:
+        raise ValueError("Gamma_diag must have length n = number of columns of A")
+
+    # enforce minimal gamma to avoid exact zeros
+    Gamma_diag = np.maximum(Gamma_diag, min_gamma)
+
     At = A.T
-    ATA = At.dot(A)
-    G = np.diag(Gamma_diag)
-    M = ATA + G
-    M = (M + M.T) / 2.0
-    RHS = At.dot(B)
+    ATA = At.dot(A)               # n x n
+    RHS = At.dot(B)              # n x T
+
+    # Form symmetric base matrix
+    M_base = ATA + np.diag(Gamma_diag)
+    M_base = (M_base + M_base.T) / 2.0  # enforce symmetry
+
+    # 1) Try Cholesky directly
     try:
-        cho = la.cho_factor(M, overwrite_a=False, check_finite=False)
+        cho = la.cho_factor(M_base, overwrite_a=False, check_finite=False)
         X = la.cho_solve(cho, RHS, overwrite_b=False)
+        return X
     except la.LinAlgError:
-        X = la.solve(M, RHS, assume_a='pos')
-    return X
+        # fall through to jitter attempts
+        pass
+
+    # 2) Try diagonal jitter sequence
+    for jitter in jitter_list:
+        M_try = M_base.copy()
+        M_try[np.diag_indices(n)] += jitter
+        M_try = (M_try + M_try.T) / 2.0
+        try:
+            cho = la.cho_factor(M_try, overwrite_a=False, check_finite=False)
+            X = la.cho_solve(cho, RHS, overwrite_b=False)
+            # Optional: logging: cholesky succeeded with jitter
+            # print(f"[solve_tikhonov_robust] Cholesky succeeded with jitter={jitter:.1e}")
+            return X
+        except la.LinAlgError:
+            continue
+
+    # 3) Eigen-decomposition fallback (clip small/negative eigenvalues)
+    try:
+        eigvals, eigvecs = la.eigh(M_base)  # eigvals ascending
+        eigvals_clipped = np.maximum(eigvals, eig_clip)
+        inv_diag = 1.0 / eigvals_clipped  # length n
+        # compute X = V * diag(1/lam) * V^T * RHS efficiently:
+        Vt_RHS = eigvecs.T.dot(RHS)            # n x T
+        scaled = inv_diag[:, None] * Vt_RHS    # n x T
+        X = eigvecs.dot(scaled)                # n x T
+        # Optional: logging
+        # print("[solve_tikhonov_robust] used eigen-decomposition fallback with eig_clip =", eig_clip)
+        return X
+    except Exception as e:
+        # proceed to last resort
+        last_eig_exc = e
+
+    # 4) Last resort: augmented least-squares (always works)
+    try:
+        sqrtG_vec = np.sqrt(Gamma_diag)   # length n
+        # Build augmented matrix: [A; diag(sqrtG_vec)]
+        A_aug = np.vstack([A, np.diag(sqrtG_vec)])    # (m+n) x n
+        B_aug = np.vstack([B, np.zeros((n, B.shape[1]), dtype=np.float64)])  # (m+n) x T
+        # Solve least-squares for multiple RHS; returns X (n x T)
+        X_ls, *_ = np.linalg.lstsq(A_aug, B_aug, rcond=None)
+        # Optional: logging
+        # print("[solve_tikhonov_robust] used augmented least-squares fallback")
+        return X_ls
+    except Exception as e2:
+        raise RuntimeError(
+            "solve_tikhonov_robust: all fallbacks failed. "
+            f"Eigen fallback exception: {last_eig_exc}. Last fallback exception: {e2}"
+        )
+
 
 # ----------------------------
 # MODULE: metrics_and_losses
