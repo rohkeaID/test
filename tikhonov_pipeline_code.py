@@ -342,6 +342,82 @@ def make_synthetic_A(n: int = 39, m: int = 50, structure: str = "multiscale", se
             for j in range(a, b):
                 A[:, j] += 0.85 * base.ravel() + 0.05 * rng.normal(size=m)
     return A
+    
+def choose_pca_components(
+        A,
+        block_count,
+        energy_cut=0.995,
+        parallel_trials=50,
+        random_state=0
+    ):
+    """
+    Adaptive n_components selector using:
+    1) energy cutoff
+    2) parallel analysis (Horn, 1965)
+    3) safety lower bound = block_count + 3
+    4) minimum allowed value = 6
+
+    Parameters
+    ----------
+    A : ndarray of shape (m, d)
+        Input data matrix.
+    block_count : int
+        Number of spectral blocks detected earlier.
+    energy_cut : float
+        Required fraction of explained variance.
+    parallel_trials : int
+        Number of random matrices for parallel analysis.
+    random_state : int
+
+    Returns
+    -------
+    n_components : int
+    """
+
+    m, d = A.shape
+    rng = np.random.default_rng(random_state)
+
+    # ---------------------------------------------------------
+    # 1. Energy cutoff rule
+    # ---------------------------------------------------------
+    pca_full = PCA(n_components=min(m, d), svd_solver='full')
+    pca_full.fit(A)
+    evr = pca_full.explained_variance_ratio_
+    cumsum = np.cumsum(evr)
+    k_energy = int(np.searchsorted(cumsum, energy_cut) + 1)
+
+    # ---------------------------------------------------------
+    # 2. Parallel analysis
+    # ---------------------------------------------------------
+    # Generate random matrices with same shape and variance
+    rand_vars = []
+    A_std = np.std(A, axis=0, ddof=1)
+    for _ in range(parallel_trials):
+        R = rng.normal(0, A_std, size=(m, d))
+        pca_r = PCA(n_components=min(m, d), svd_solver='full')
+        pca_r.fit(R)
+        rand_vars.append(pca_r.explained_variance_)
+
+    rand_vars = np.stack(rand_vars, axis=0)
+    rand_mean = rand_vars.mean(axis=0)
+
+    # Keep components whose eigenvalue > average random eigenvalue
+    true_vals = pca_full.explained_variance_
+    k_parallel = int(np.sum(true_vals > rand_mean))
+
+    # ---------------------------------------------------------
+    # 3. Theoretical safety margin from block decomposition
+    # ---------------------------------------------------------
+    k_safety = block_count + 3  # justified above
+
+    # ---------------------------------------------------------
+    # 4. Combine all criteria
+    # ---------------------------------------------------------
+    k = max(k_energy, k_parallel, k_safety, 6)
+    k = min(k, d)  # cannot exceed dimensionality
+
+    return k
+
 
 def demo_pipeline():
     """
@@ -366,7 +442,7 @@ def demo_pipeline():
     print("Spectrum blocks (indices):", blocks)
 
     # PCA-on-V clustering for columns (diagnostic)
-    d = min(6, Vt_keep.shape[0])
+    d = choose_pca_components(A, len(blocks), energy_cut=0.995)
     Vcoords = (Vt_keep.T)[:, :d]
     pca = PCA(n_components=d)
     pca_feats = pca.fit_transform(Vcoords)
