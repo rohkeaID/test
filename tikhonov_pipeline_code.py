@@ -126,6 +126,26 @@ def map_blocks_to_columns(Vt_keep: np.ndarray, blocks: list, s: np.ndarray = Non
     row_sums[row_sums == 0] = 1.0  # avoid divide by zero
     Wn = Wraw / row_sums
     return Wn, Wraw
+    
+# ----------------------------
+# Safe theta initialization (now caps initial theta to upper_init, default 1e4)
+# ----------------------------
+def init_theta(s_full, blocks, upper_init=1e4, lower_init=1e-12, alpha_init=1.0):
+    """
+    Compute initial theta per block with caps to avoid enormous initial gamma.
+    Returns theta0 (K,).
+    """
+    s_arr = np.asarray(s_full, dtype=np.float64)
+    K = len(blocks)
+    avg_s_block = np.array([np.mean(s_arr[b]) if len(b) > 0 else s_arr[0] for b in blocks], dtype=np.float64)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        theta0_raw = alpha_init * (s_arr[0]**2) / (avg_s_block**2 + 1e-30)
+    theta0_raw = np.nan_to_num(theta0_raw, posinf=upper_init, neginf=lower_init)
+    theta0 = np.clip(theta0_raw, lower_init, upper_init)
+    n_clipped = np.sum(theta0_raw > upper_init)
+    if n_clipped > 0:
+        print(f"[init_theta_safe] {n_clipped}/{K} theta values clipped to upper_init={upper_init:.1e}")
+    return theta0
 
 def compose_gamma_from_theta(theta: np.ndarray, Wn: np.ndarray, residual: np.ndarray = None, gamma_bounds=(1e-12, 1e12)):
     """
