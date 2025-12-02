@@ -690,6 +690,323 @@ def choose_pca_components(
     k = min(k, d)  # cannot exceed dimensionality
 
     return k
+    
+    
+"""
+Adaptive spectrum partition + PCA clustering with retries & safety checks.
+
+Интегрируйте эти функции в pipeline. Предполагается, что у вас есть:
+- safe_svd(A, tol_rel) -> (U_keep, s_keep, Vt_keep, diag)
+- compose_gamma_from_theta(theta, Wn, ...)
+- init_theta_safe(s_full, blocks, upper_init=..., ...)
+- solve_tikhonov_robust(...)  (robust solver из предыдущих версий)
+
+Этот модуль не вызывает оптимизацию — он только подготавливает
+Wn, theta0 и gamma_init в безопасном виде, адаптируя partition/clustering.
+"""
+
+import numpy as np
+from sklearn.decomposition import PCA
+from sklearn.cluster import KMeans
+import copy
+import math
+
+# -----------------------
+# Diagnostics / checks
+# -----------------------
+def mapping_quality_checks(Wraw, Wn, theta0, gamma_init,
+                           max_gamma_warn=1e6,
+                           max_fraction_clipped=0.2,
+                           min_row_sum_tol=1e-12):
+    """
+    Проверки качества mapping (Wraw, Wn), theta0, gamma_init.
+    Возвращает (ok:bool, problems:list_of_messages, stats:dict)
+    """
+    problems = []
+    stats = {}
+    # NaN / Inf checks
+    if np.any(np.isnan(Wraw)) or np.any(np.isinf(Wraw)):
+        problems.append("Wraw contains NaN/Inf")
+    if np.any(np.isnan(Wn)) or np.any(np.isinf(Wn)):
+        problems.append("Wn contains NaN/Inf")
+    # row sums
+    row_sums = np.sum(Wraw, axis=1)
+    stats['min_row_sum'] = float(np.min(row_sums))
+    stats['max_row_sum'] = float(np.max(row_sums))
+    zeros = np.sum(row_sums < min_row_sum_tol)
+    stats['n_zero_row_sum'] = int(zeros)
+    if zeros > 0:
+        problems.append(f"{zeros} columns have near-zero total weight (sum_w < {min_row_sum_tol})")
+    # theta clipping / extremes
+    theta0 = np.asarray(theta0, dtype=np.float64)
+    n_theta = theta0.size
+    clipped_high = np.sum(~np.isfinite(theta0)) + np.sum(theta0 > 1e10)
+    stats['n_theta_clipped_high'] = int(clipped_high)
+    if clipped_high > 0:
+        problems.append(f"{clipped_high}/{n_theta} theta0 are non-finite or >1e10")
+    # gamma extremes
+    gamma_init = np.asarray(gamma_init, dtype=np.float64)
+    stats['gamma_min'] = float(np.min(gamma_init))
+    stats['gamma_max'] = float(np.max(gamma_init))
+    stats['gamma_mean'] = float(np.mean(gamma_init))
+    if not np.isfinite(stats['gamma_min']) or not np.isfinite(stats['gamma_max']):
+        problems.append("gamma_init contains NaN/Inf")
+    if stats['gamma_max'] > max_gamma_warn:
+        problems.append(f"gamma_init max {stats['gamma_max']:.3e} exceeds warn threshold {max_gamma_warn:.3e}")
+    # fraction clipped check (if theta0 was clipped externally)
+    # We do best-effort: if theta0 has values exactly equal to upper bound typical (1e8..1e12)
+    large_mask = theta0 > 1e8
+    frac_large = np.mean(large_mask)
+    stats['frac_theta_very_large'] = float(frac_large)
+    if frac_large > max_fraction_clipped:
+        problems.append(f"High fraction ({frac_large:.2%}) of theta0 exceed 1e8 (likely clipped)")
+    ok = (len(problems) == 0)
+    return ok, problems, stats
+
+# -----------------------
+# Merge tiny-energy blocks
+# -----------------------
+def merge_small_energy_blocks(s_full, blocks, energy_thresh_rel=1e-6):
+    """
+    Если блоки имеют очень малую суммарную энергию (по s^2), сливаем их
+    с ближайшим соседом (по индексу).
+    Возвращает новые blocks.
+    """
+    s = np.asarray(s_full, dtype=np.float64)
+    K = len(blocks)
+    energies = np.array([np.sum(s[b]**2) for b in blocks])
+    total_energy = np.sum(s**2) + 1e-30
+    rel = energies / total_energy
+    # find tiny blocks
+    tiny = np.where(rel < energy_thresh_rel)[0].tolist()
+    if not tiny:
+        return blocks  # nothing to do
+    blocks_new = [list(b) for b in blocks]  # copy
+    # merge from smallest to largest index to avoid reindexing issues
+    for idx in sorted(tiny, reverse=True):
+        if idx == 0:
+            # merge into next
+            if len(blocks_new) > 1:
+                blocks_new[1] = blocks_new[0] + blocks_new[1]
+                del blocks_new[0]
+        else:
+            # merge into previous
+            blocks_new[idx-1] = blocks_new[idx-1] + blocks_new[idx]
+            del blocks_new[idx]
+    return blocks_new
+
+# -----------------------
+# Safe mapping function (handles zero row sums)
+# -----------------------
+def safe_map_blocks_to_columns(Vt_keep, blocks, s=None, use_weighted=False, eps_row_sum=1e-30):
+    """
+    Computes Wraw and Wn robustly: if a column has zero total weight,
+    perform a fallback: assign it hard to the block with max per-block raw score
+    (or uniform if everything zero).
+    """
+    V = Vt_keep.T
+    n, r = V.shape
+    K = len(blocks)
+    Wraw = np.zeros((n, K), dtype=np.float64)
+    for k, blk in enumerate(blocks):
+        if len(blk) == 0:
+            continue
+        if use_weighted and (s is not None):
+            Wraw[:, k] = np.sum((V[:, blk]**2) * (s[blk]**2)[None, :], axis=1)
+        else:
+            Wraw[:, k] = np.sum(V[:, blk]**2, axis=1)
+    # detect numeric issues
+    row_sums = np.sum(Wraw, axis=1)
+    zero_mask = row_sums <= eps_row_sum
+    # if any zero row sums: try fallback strategies
+    if np.any(zero_mask):
+        # For those columns compute per-block abs projection (without normalization)
+        # If all Wraw row is zero, assign to block of maximal avg energy
+        block_energy = np.array([np.sum(s[blk]**2) if (s is not None and len(blk)>0) else 0.0 for blk in blocks])
+        if np.allclose(block_energy, 0):
+            # fallback: uniform weights
+            Wn = np.ones((n, K), dtype=np.float64) / max(1, K)
+            return Wn, Wraw
+        # For each zero-row, assign to block with max block_energy (or fallback to block 0)
+        for j in np.where(zero_mask)[0]:
+            # compute simple heuristic: find block index with maximal block_energy
+            best = int(np.argmax(block_energy))
+            Wraw[j, best] = 1.0
+    # now normalise rows safely
+    row_sums = np.sum(Wraw, axis=1, keepdims=True)
+    row_sums[row_sums <= eps_row_sum] = 1.0
+    Wn = Wraw / row_sums
+    return Wn, Wraw
+
+# -----------------------
+# Adaptive partition + clustering routine
+# -----------------------
+def adaptive_partition_and_clustering(Vt_keep, s_full,
+                                      initial_max_blocks=10,
+                                      initial_gap_multiplier=2.0,
+                                      energy_tail_cut=0.995,
+                                      max_retries=6,
+                                      use_weighted=False,
+                                      p_leverage=1.0,
+                                      upper_init_theta=1e4):
+    """
+    Core adaptive routine. Tries different partition / clustering parameters until mapping is OK.
+
+    Inputs:
+      Vt_keep : retained right singular vectors (r x n) as in previous code
+      s_full : full singular values array (length r or full)
+      initial_max_blocks : starting guess for max_blocks (could be large)
+      initial_gap_multiplier : starting gap multiplier
+      energy_tail_cut : passed to spectrum partition logic if used
+      max_retries : max number of adapt attempts
+      use_weighted : in mapping, use s_i^2 weights
+      upper_init_theta : cap for initial theta0
+
+    Returns:
+      dict with keys: Wn, Wraw, blocks, theta0, gamma_init, diagnostics (list of attempts)
+    """
+    # safe copies
+    s_full = np.asarray(s_full, dtype=np.float64)
+    Vt_keep = np.asarray(Vt_keep, dtype=np.float64)
+    n = Vt_keep.shape[1]
+    # adaptive parameters that can be changed
+    max_blocks = int(initial_max_blocks)
+    gap_multiplier = float(initial_gap_multiplier)
+    energy_tail = float(energy_tail_cut)
+    n_components = None  # we may set for PCA if needed
+
+    diagnostics = []
+    # We'll attempt up to max_retries variations: progressively coarsen partition and/or increase PCA components
+    for attempt in range(max_retries):
+        attempt_info = {'attempt': attempt, 'max_blocks': max_blocks, 'gap_multiplier': gap_multiplier, 'n_components': n_components}
+        # 1) Partition spectrum into blocks (call user-provided spectrum_diag or implement simple heuristic here)
+        # If user has spectrum_diag(s, ...) use that; otherwise fall back to basic splitting by gaps.
+        try:
+            # we assume user has function spectrum_diag; otherwise implement simple fallback
+            from inspect import getsource
+            # prefer to call existing spectrum_diag if present in globals
+            if 'spectrum_diag' in globals():
+                blocks = spectrum_diag(s_full, energy_tail_cut=energy_tail, max_blocks=max_blocks, gap_multiplier=gap_multiplier)
+            else:
+                # simple fallback: split s_full into max_blocks contiguous parts
+                L = len(s_full)
+                splits = np.array_split(np.arange(L), max_blocks)
+                blocks = [list(sp) for sp in splits]
+        except Exception as e:
+            # fallback: uniform split
+            L = len(s_full)
+            splits = np.array_split(np.arange(L), max_blocks)
+            blocks = [list(sp) for sp in splits]
+
+        attempt_info['blocks_before_merge'] = copy.deepcopy(blocks)
+        # Merge tiny-energy blocks to avoid empty blocks
+        blocks = merge_small_energy_blocks(s_full, blocks, energy_thresh_rel=1e-8)
+        attempt_info['blocks_after_merge'] = copy.deepcopy(blocks)
+
+        # 2) Optionally choose n_components for PCA based on number of blocks
+        if n_components is None:
+            # minimal components: at least number of blocks, at least 6, at most min(n, 20)
+            n_components_try = min(max(len(blocks) + 3, 6), min(n, 20))
+        else:
+            n_components_try = min(n_components, n)
+        attempt_info['n_components_try'] = int(n_components_try)
+
+        # 3) Build mapping Wraw, Wn robustly
+        Wn, Wraw = safe_map_blocks_to_columns(Vt_keep, blocks, s=s_full if use_weighted else None, use_weighted=use_weighted)
+        attempt_info['Wraw_norm_stats'] = {'min': float(np.min(Wraw)), 'max': float(np.max(Wraw))}
+        # 4) init theta0 (safe)
+        # We'll use a block-level heuristic: theta_B ~ (s1^2)/(mean s in block^2), but clipped to upper_init_theta
+        K = len(blocks)
+        avg_s_block = np.array([np.mean(s_full[b]) if len(b)>0 else s_full[0] for b in blocks])
+        with np.errstate(divide='ignore', invalid='ignore'):
+            theta0_raw = (s_full[0]**2) / (avg_s_block**2 + 1e-30)
+        theta0_raw = np.nan_to_num(theta0_raw, posinf=upper_init_theta, neginf=1e-12)
+        theta0 = np.clip(theta0_raw, 1e-12, upper_init_theta)
+        attempt_info['theta0_raw_max'] = float(np.max(theta0_raw))
+        attempt_info['theta0_max'] = float(np.max(theta0))
+
+        # 5) compose gamma and (optionally) leverage correction
+        gamma_init = compose_gamma_from_theta(theta0, Wn, gamma_bounds=(1e-12, 1e12))
+        # leverage correction (weak): shrink gamma by (1 - beta * leverage)
+        # compute leverage from Vt_keep if available
+        try:
+            lev = column_leverage(Vt_keep, p=p_leverage)
+            beta = 0.4
+            gamma_levered = gamma_init * (1 - beta * lev)
+            # apply if it reduces maxima (avoid creating negatives)
+            gamma_levered = np.clip(gamma_levered, 1e-12, 1e12)
+            # use levered gamma for diagnostics only; don't overwrite gamma_init yet
+        except Exception:
+            gamma_levered = gamma_init.copy()
+
+        attempt_info['gamma_init_max'] = float(np.max(gamma_init))
+        attempt_info['gamma_levered_max'] = float(np.max(gamma_levered))
+
+        # 6) Quality checks
+        ok, problems, stats = mapping_quality_checks(Wraw, Wn, theta0, gamma_init,
+                                                    max_gamma_warn=1e6,
+                                                    max_fraction_clipped=0.25,
+                                                    min_row_sum_tol=1e-14)
+        attempt_info['ok'] = ok
+        attempt_info['problems'] = problems
+        attempt_info['stats'] = stats
+
+        diagnostics.append(attempt_info)
+
+        if ok:
+            # success: return mapping and initializations
+            return {
+                'Wn': Wn, 'Wraw': Wraw, 'blocks': blocks,
+                'theta0': theta0, 'gamma_init': gamma_init,
+                'gamma_levered': gamma_levered,
+                'diagnostics': diagnostics
+            }
+
+        # If not ok, adapt parameters for next attempt
+        # Strategy: if too many tiny row sums -> reduce max_blocks (coarsen)
+        # If gamma too large -> cap upper_init_theta lower next try
+        # If too many theta clipped (frac large) -> decrease upper_init
+        # else increase gap_multiplier to merge blocks
+        # adjust in a conservative way
+        # evaluate stats
+        frac_large_theta = stats.get('frac_theta_very_large', 0.0)
+        gamma_max = stats.get('gamma_max', np.nan)
+        n_zero_rows = stats.get('n_zero_row_sum', 0)
+
+        # Heuristic adjustments
+        changed = False
+        # Prefer coarsening if many zero rows or too many blocks
+        if n_zero_rows > max(1, int(0.01 * n)):
+            # strongly coarsen
+            max_blocks = max(1, int(max_blocks * 0.5))
+            gap_multiplier = min(gap_multiplier * 1.5, 10.0)
+            changed = True
+        elif frac_large_theta > 0.2 or (not math.isfinite(gamma_max)) or (gamma_max > 1e8):
+            # theta too extreme -> reduce upper_init and coarsen
+            upper_init_theta = max(1.0, upper_init_theta * 0.1)
+            max_blocks = max(1, int(max_blocks * 0.7))
+            changed = True
+        else:
+            # mild change: increase gap multiplier to merge nearby modes
+            gap_multiplier = min(gap_multiplier * 1.25, 10.0)
+            # and reduce max_blocks slowly
+            if max_blocks > 3:
+                max_blocks = max(3, int(max_blocks - 1))
+            changed = True
+
+        # If nothing changed, break to avoid infinite loop
+        if not changed:
+            break
+
+    # If reached here — failed to produce OK mapping
+    return {
+        'Wn': Wn, 'Wraw': Wraw, 'blocks': blocks,
+        'theta0': theta0, 'gamma_init': gamma_init,
+        'gamma_levered': gamma_levered,
+        'diagnostics': diagnostics,
+        'error': 'adaptive_partition_and_clustering: failed to find stable mapping after retries'
+    }
+
 
 
 def demo_pipeline():
@@ -710,33 +1027,53 @@ def demo_pipeline():
     plot_scree(s_full[:min(len(s_full), 80)])
     plot_cum_energy(s_full[:min(len(s_full), 80)])
 
-    # spectrum partition
-    blocks = spectrum_diag(s_full, energy_tail_cut=0.995, max_blocks=3, gap_multiplier=2.0)
-    print("Spectrum blocks (indices):", blocks)
+#    # spectrum partition
+#    blocks = spectrum_diag(s_full, energy_tail_cut=0.995, max_blocks=3, gap_multiplier=2.0)
+#    print("Spectrum blocks (indices):", blocks)
+#
+#    # PCA-on-V clustering for columns (diagnostic)
+#    d = choose_pca_components(A, len(blocks), energy_cut=0.995)
+#    Vcoords = (Vt_keep.T)[:, :d]
+#    pca = PCA(n_components=d)
+#    pca_feats = pca.fit_transform(Vcoords)
+#    kmeans = KMeans(n_clusters=min(3, max(1, d)), random_state=0).fit(pca_feats)
+#    clusters = [np.where(kmeans.labels_ == k)[0].tolist() for k in range(kmeans.n_clusters)]
+#    print("Column clusters sizes:", [len(c) for c in clusters])
+#
+#    # mapping blocks -> columns
+#    Wn, Wraw = map_blocks_to_columns(Vt_keep, blocks, s=s_full, use_weighted=False)
+#    plot_W_heatmap(Wn)
+#
+#    # init theta heuristics
+#    K = len(blocks)
+#    s_arr = s_full
+#    avg_s_block = np.array([np.mean(s_arr[b]) if len(b) > 0 else s_arr[0] for b in blocks])
+#    theta0 = 1.0 * (s_arr[0]**2 / (avg_s_block**2 + 1e-30))
+#    theta0 = np.clip(theta0, 1e-12, 1e12)
+#    print("Initial theta (per block):", theta0)
+#
+#    # compose gamma
+#    gamma_init = compose_gamma_from_theta(theta0, Wn)
 
-    # PCA-on-V clustering for columns (diagnostic)
-    d = choose_pca_components(A, len(blocks), energy_cut=0.995)
-    Vcoords = (Vt_keep.T)[:, :d]
-    pca = PCA(n_components=d)
-    pca_feats = pca.fit_transform(Vcoords)
-    kmeans = KMeans(n_clusters=min(3, max(1, d)), random_state=0).fit(pca_feats)
-    clusters = [np.where(kmeans.labels_ == k)[0].tolist() for k in range(kmeans.n_clusters)]
-    print("Column clusters sizes:", [len(c) for c in clusters])
+    adapt_res = adaptive_partition_and_clustering(Vt_keep, s_full,
+                                              initial_max_blocks=10,
+                                              initial_gap_multiplier=2.0,
+                                              energy_tail_cut=0.995,
+                                              max_retries=6,
+                                              use_weighted=False,
+                                              p_leverage=1.0,
+                                              upper_init_theta=1e4)
+    if 'error' in adapt_res:
+        # логируем diagnostics и выбираем fallback (упростить вручную)
+        print(adapt_res['diagnostics'])
+    else:
+        Wn = adapt_res['Wn']
+        Wraw = adapt_res['Wraw']
+        blocks = adapt_res['blocks']
+        theta0 = adapt_res['theta0']
+        gamma_init = adapt_res['gamma_init']
+    diagnostics = adapt_res['diagnostics']
 
-    # mapping blocks -> columns
-    Wn, Wraw = map_blocks_to_columns(Vt_keep, blocks, s=s_full, use_weighted=False)
-    plot_W_heatmap(Wn)
-
-    # init theta heuristics
-    K = len(blocks)
-    s_arr = s_full
-    avg_s_block = np.array([np.mean(s_arr[b]) if len(b) > 0 else s_arr[0] for b in blocks])
-    theta0 = 1.0 * (s_arr[0]**2 / (avg_s_block**2 + 1e-30))
-    theta0 = np.clip(theta0, 1e-12, 1e12)
-    print("Initial theta (per block):", theta0)
-
-    # compose gamma
-    gamma_init = compose_gamma_from_theta(theta0, Wn)
 
     # leverage correction (lev_beta corresponds to earlier 'beta' param)
     lev = column_leverage(Vt_keep, p=1.0)
