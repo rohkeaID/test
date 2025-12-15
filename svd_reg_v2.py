@@ -18,6 +18,54 @@ def prepare_svd(A, B):
 # 1. Подбор регуляризации f (одна для всех b)
 # =====================================================
 
+def compute_X(f, U, V, UB):
+    return V @ (f[:, None] * UB)
+
+def max_violation(X, l, u):
+    return max(
+        np.max(np.maximum(l[:, None] - X, 0)),
+        np.max(np.maximum(X - u[:, None], 0))
+    )
+
+def find_active_constraints(f, U, V, UB, l, u, tol=1e-8):
+    X = compute_X(f, U, V, UB)
+    active = []
+
+    for k in range(X.shape[1]):
+        xk = X[:, k]
+        low = np.where(xk < l - tol)[0]
+        high = np.where(xk > u + tol)[0]
+
+        for j in low:
+            active.append((k, j, "low"))
+        for j in high:
+            active.append((k, j, "high"))
+
+    return active
+
+
+def build_constraints(active, U, V, UB, l, u):
+    Arows = []
+    lb = []
+    ub = []
+
+    for (k, j, side) in active:
+        z = UB[:, k]
+        row = V[j, :] * z   # 1 × n
+
+        Arows.append(row)
+        if side == "low":
+            lb.append(l[j])
+            ub.append(np.inf)
+        else:
+            lb.append(-np.inf)
+            ub.append(u[j])
+
+    return np.array(Arows), np.array(lb), np.array(ub)
+
+
+
+
 def fit_regularization(A, B, l, u, maxiter=300):
     U, s, V, UB, alpha = prepare_svd(A, B)
     n = A.shape[1]
@@ -61,6 +109,43 @@ def fit_regularization(A, B, l, u, maxiter=300):
     )
 
     return res, f0, U, s, V, UB, alpha
+
+
+def fit_regularization_constraint_generation(A, B, l, u, maxiter=500, max_outer=10):
+    U, s, V, UB, alpha = prepare_svd(A, B)
+
+    def obj(f):
+        return np.sum(alpha * (s**2 * f - 1.0)**2)
+
+    def grad(f):
+        return 2 * alpha * (s**2 * f - 1.0) * s**2
+
+    bounds = Bounds(0.0, 1.0 / s)
+    f = 1.0 / s  # старт: минимальный RMS
+
+    for it in range(max_outer):
+        active = find_active_constraints(f, U, V, UB, l, u)
+
+        print(f"[Iter {it}] active constraints:", len(active))
+        if not active:
+            print("All constraints satisfied.")
+            break
+
+        Acons, lb, ub = build_constraints(active, U, V, UB, l, u)
+        lin_con = LinearConstraint(Acons, lb, ub)
+
+        res = minimize(
+            obj, f, jac=grad,
+            method="trust-constr",
+            constraints=[lin_con],
+            bounds=bounds,
+            options=dict(maxiter=maxiter, verbose=2)
+        )
+
+        f = res.x
+
+    return f, 1.0 / s, U, s, V, UB, alpha
+
 
 
 # =====================================================
