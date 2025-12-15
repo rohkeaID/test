@@ -122,16 +122,22 @@ def fit_regularization_constraint_generation(A, B, l, u, maxiter=500, max_outer=
 
     bounds = Bounds(0.0, 1.0 / s)
     f = 1.0 / s  # старт: минимальный RMS
+    
+    Active = []   # список ВСЕХ ограничений
+
 
     for it in range(max_outer):
-        active = find_active_constraints(f, U, V, UB, l, u)
+        newly_active = find_active_constraints(f, U, V, UB, l, u)
 
         print(f"[Iter {it}] active constraints:", len(active))
-        if not active:
-            print("All constraints satisfied.")
+        if not newly_active:
+            print("All constraints satisfied. Converged to global optimum.")
             break
+        
+        Active.extend(newly_active)  # <<< КЛЮЧЕВО
+        Active = list(set(Active))   # убрать дубли
 
-        Acons, lb, ub = build_constraints(active, U, V, UB, l, u)
+        Acons, lb, ub = build_constraints(Active, U, V, UB, l, u)
         lin_con = LinearConstraint(Acons, lb, ub)
 
         res = minimize(
